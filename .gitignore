@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local Codex/session data
+.codex
+.codex/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Archives and packaged artifacts
+*.rar
+*.zip
+*.7z
+*.tgz
+*.tar
+*.tar.gz
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
