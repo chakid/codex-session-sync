@@ -191,6 +191,19 @@ export async function cloneSession(threadId: string, modelProvider: string) {
   });
 }
 
+export async function batchCloneSessions(threadIds: string[], modelProvider: string) {
+  return fetchJson<{
+    result: {
+      modelProvider: string;
+      clonedIds: string[];
+      skippedIds: string[];
+    };
+  }>("/api/sessions/batch/clone", {
+    method: "POST",
+    body: JSON.stringify({ threadIds, modelProvider })
+  });
+}
+
 export async function retargetSession(threadId: string, modelProvider: string) {
   return fetchJson<{
     result: {

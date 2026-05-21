@@ -4,7 +4,9 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import "element-plus/es/components/message/style/css";
 import "element-plus/es/components/message-box/style/css";
 import {
+  batchCloneSessions,
   batchRetargetSessions,
+  cloneSession,
   exportSelectedSessions,
   getConfig,
   getProviders,
@@ -25,6 +27,8 @@ const CODEX_HOME_STORAGE_KEY = "codex-sessions.codex-home";
 const loading = ref(false);
 const migrating = ref(false);
 const batchMigrating = ref(false);
+const cloning = ref(false);
+const batchCloning = ref(false);
 const exporting = ref(false);
 const importing = ref(false);
 const detailLoading = ref(false);
@@ -43,6 +47,8 @@ const filters = reactive({
 
 const dialogVisible = ref(false);
 const batchDialogVisible = ref(false);
+const cloneDialogVisible = ref(false);
+const batchCloneDialogVisible = ref(false);
 const detailVisible = ref(false);
 const importDialogVisible = ref(false);
 const configDialogVisible = ref(false);
@@ -56,6 +62,12 @@ const migrationForm = reactive({
   targetProvider: ""
 });
 const batchMigrationForm = reactive({
+  targetProvider: ""
+});
+const cloneForm = reactive({
+  targetProvider: ""
+});
+const batchCloneForm = reactive({
   targetProvider: ""
 });
 const codexHomeForm = reactive({
@@ -338,6 +350,12 @@ function openMigrateDialog(session: SessionSummary) {
   dialogVisible.value = true;
 }
 
+function openCloneDialog(session: SessionSummary) {
+  activeSession.value = session;
+  cloneForm.targetProvider = providerOptions.value.find((provider) => provider !== session.model_provider) ?? "";
+  cloneDialogVisible.value = true;
+}
+
 function openBatchMigrateDialog() {
   if (selectedSessions.value.length === 0) {
     ElMessage.warning("请先选择要迁移的会话。");
@@ -351,6 +369,21 @@ function openBatchMigrateDialog() {
       ? hasDifferentProviderOption ?? ""
       : "";
   batchDialogVisible.value = true;
+}
+
+function openBatchCloneDialog() {
+  if (selectedSessions.value.length === 0) {
+    ElMessage.warning("请先选择要克隆的会话。");
+    return;
+  }
+
+  const firstProvider = selectedSessions.value[0]?.model_provider ?? "";
+  const hasDifferentProviderOption = providerOptions.value.find((provider) => provider !== firstProvider);
+  batchCloneForm.targetProvider =
+    selectedSessions.value.every((session) => session.model_provider === firstProvider)
+      ? hasDifferentProviderOption ?? ""
+      : "";
+  batchCloneDialogVisible.value = true;
 }
 
 async function openDetailDrawer(session: SessionSummary) {
@@ -378,6 +411,17 @@ function resetDialogState() {
 function resetBatchDialogState() {
   batchDialogVisible.value = false;
   batchMigrationForm.targetProvider = "";
+}
+
+function resetCloneDialogState() {
+  cloneDialogVisible.value = false;
+  activeSession.value = null;
+  cloneForm.targetProvider = "";
+}
+
+function resetBatchCloneDialogState() {
+  batchCloneDialogVisible.value = false;
+  batchCloneForm.targetProvider = "";
 }
 
 function resetDetailState() {
@@ -473,6 +517,49 @@ async function submitMigration() {
   }
 }
 
+async function submitClone() {
+  if (!activeSession.value) {
+    return;
+  }
+
+  if (!cloneForm.targetProvider) {
+    ElMessage.warning("请选择目标 provider。");
+    return;
+  }
+
+  if (cloneForm.targetProvider === activeSession.value.model_provider) {
+    ElMessage.warning("目标 provider 需要和当前 provider 不同。");
+    return;
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `将当前会话克隆为 ${cloneForm.targetProvider} provider 的新会话，原会话会保留不变，是否继续？`,
+      "确认克隆",
+      {
+        type: "warning",
+        confirmButtonText: "执行克隆",
+        cancelButtonText: "取消"
+      }
+    );
+  } catch {
+    return;
+  }
+
+  cloning.value = true;
+  try {
+    const response = await cloneSession(activeSession.value.id, cloneForm.targetProvider);
+    ElMessage.success(`克隆成功：${response.result.clonedId}`);
+
+    await refreshData();
+    resetCloneDialogState();
+  } catch (error) {
+    showErrorMessage(error);
+  } finally {
+    cloning.value = false;
+  }
+}
+
 async function submitBatchMigration() {
   if (selectedSessions.value.length === 0) {
     ElMessage.warning("请先选择要迁移的会话。");
@@ -527,6 +614,63 @@ async function submitBatchMigration() {
     showErrorMessage(error);
   } finally {
     batchMigrating.value = false;
+  }
+}
+
+async function submitBatchClone() {
+  if (selectedSessions.value.length === 0) {
+    ElMessage.warning("请先选择要克隆的会话。");
+    return;
+  }
+
+  if (!batchCloneForm.targetProvider) {
+    ElMessage.warning("请选择目标 provider。");
+    return;
+  }
+
+  const targetProvider = batchCloneForm.targetProvider.trim();
+  const skipped = selectedSessions.value.filter((session) => session.model_provider === targetProvider);
+  const candidates = selectedSessions.value.filter((session) => session.model_provider !== targetProvider);
+
+  if (candidates.length === 0) {
+    ElMessage.warning("选中的会话当前已经属于目标 provider，无法克隆到同一 provider。");
+    return;
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `将 ${candidates.length} 个会话克隆到 ${targetProvider}，原会话会保留不变，是否继续？`,
+      "确认批量克隆",
+      {
+        type: "warning",
+        confirmButtonText: "开始克隆",
+        cancelButtonText: "取消"
+      }
+    );
+  } catch {
+    return;
+  }
+
+  batchCloning.value = true;
+
+  try {
+    const response = await batchCloneSessions(
+      candidates.map((session) => session.id),
+      targetProvider
+    );
+
+    await refreshData();
+    selectedIds.value = [];
+    await nextTick();
+    await syncTableSelection();
+    resetBatchCloneDialogState();
+    const totalSkipped = skipped.length + response.result.skippedIds.length;
+    const skippedSuffix = totalSkipped ? `，跳过 ${totalSkipped} 个已属于目标 provider 的会话` : "";
+    ElMessage.success(`批量克隆完成：成功 ${response.result.clonedIds.length} 个${skippedSuffix}`);
+  } catch (error) {
+    showErrorMessage(error);
+  } finally {
+    batchCloning.value = false;
   }
 }
 
@@ -764,7 +908,15 @@ onMounted(() => {
             >
               批量迁移
             </el-button>
-            <el-button type="danger" plain disabled>批量克隆</el-button>
+            <el-button
+              type="danger"
+              plain
+              :loading="batchCloning"
+              :disabled="selectedSessions.length === 0"
+              @click="openBatchCloneDialog"
+            >
+              批量克隆
+            </el-button>
           </el-space>
 
           <div class="selection-summary">
@@ -816,7 +968,7 @@ onMounted(() => {
                   <el-space>
                     <el-button size="small" type="info" link @click="openDetailDrawer(row)">详情</el-button>
                     <el-button size="small" type="primary" link @click="openMigrateDialog(row)">迁移</el-button>
-                    <el-button size="small" type="danger" link disabled>克隆</el-button>
+                    <el-button size="small" type="danger" link @click="openCloneDialog(row)">克隆</el-button>
                   </el-space>
                 </template>
               </el-table-column>
@@ -881,6 +1033,67 @@ onMounted(() => {
       </el-dialog>
 
       <el-dialog
+        v-model="cloneDialogVisible"
+        width="560px"
+        destroy-on-close
+        align-center
+        @closed="resetCloneDialogState"
+      >
+        <template #header>
+          <div class="dialog-header">
+            <el-text type="primary">会话克隆</el-text>
+          </div>
+        </template>
+
+        <el-form label-position="top">
+          <el-form-item label="会话 ID">
+            <el-card shadow="never" class="dialog-info-card">
+              <div class="dialog-info-value">{{ activeSession?.id ?? "-" }}</div>
+            </el-card>
+          </el-form-item>
+
+          <el-form-item label="当前 provider">
+            <el-card shadow="never" class="dialog-info-card">
+              <div class="dialog-info-value">{{ activeSession?.model_provider ?? "-" }}</div>
+            </el-card>
+          </el-form-item>
+
+          <el-form-item label="目标 provider">
+            <el-select
+              v-model="cloneForm.targetProvider"
+              filterable
+              allow-create
+              default-first-option
+              placeholder="请选择或输入 provider"
+              class="dialog-provider"
+            >
+              <el-option
+                v-for="provider in providerOptions.filter((item) => item !== activeSession?.model_provider)"
+                :key="provider"
+                :label="provider"
+                :value="provider"
+              />
+            </el-select>
+          </el-form-item>
+
+          <el-alert
+            type="info"
+            :closable="false"
+            title="克隆会创建新会话并复制原会话记录；原会话不会被迁移或删除。"
+          />
+        </el-form>
+
+        <template #footer>
+          <div class="dialog-footer">
+            <el-button @click="resetCloneDialogState">取消</el-button>
+            <el-button type="primary" :loading="cloning" @click="submitClone">
+              执行克隆
+            </el-button>
+          </div>
+        </template>
+      </el-dialog>
+
+      <el-dialog
         v-model="batchDialogVisible"
         width="640px"
         destroy-on-close
@@ -934,6 +1147,71 @@ onMounted(() => {
             <el-button @click="resetBatchDialogState">取消</el-button>
             <el-button type="primary" :loading="batchMigrating" @click="submitBatchMigration">
               开始迁移
+            </el-button>
+          </div>
+        </template>
+      </el-dialog>
+
+      <el-dialog
+        v-model="batchCloneDialogVisible"
+        width="640px"
+        destroy-on-close
+        align-center
+        @closed="resetBatchCloneDialogState"
+      >
+        <template #header>
+          <div class="dialog-header">
+            <el-text type="primary">批量克隆</el-text>
+          </div>
+        </template>
+
+        <el-form label-position="top">
+          <el-form-item :label="`会话 ID（${selectedSessions.length}）`">
+            <el-card shadow="never" class="dialog-info-card">
+              <el-scrollbar max-height="220px" class="batch-session-scroll">
+                <div class="batch-session-list">
+                  <div
+                    v-for="session in selectedSessions"
+                    :key="session.id"
+                    class="batch-session-item"
+                  >
+                    {{ session.id }}
+                  </div>
+                </div>
+              </el-scrollbar>
+            </el-card>
+          </el-form-item>
+
+          <el-form-item label="目标 provider">
+            <el-select
+              v-model="batchCloneForm.targetProvider"
+              filterable
+              allow-create
+              default-first-option
+              placeholder="请选择或输入 provider"
+              class="dialog-provider"
+            >
+              <el-option
+                v-for="provider in providerOptions"
+                :key="provider"
+                :label="provider"
+                :value="provider"
+              />
+            </el-select>
+          </el-form-item>
+
+          <el-alert
+            type="info"
+            :closable="false"
+            title="批量克隆会为每个符合条件的会话创建新副本；已属于目标 provider 的会话会被跳过。"
+          />
+        </el-form>
+
+        <template #footer>
+          <div class="dialog-footer">
+            <el-button @click="resetBatchCloneDialogState">取消</el-button>
+            <el-button type="primary" :loading="batchCloning" @click="submitBatchClone">
+              开始克隆
             </el-button>
           </div>
         </template>

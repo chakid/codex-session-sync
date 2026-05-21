@@ -12,6 +12,15 @@ const FRONTEND_DIST_DIR = path.resolve(
   "dist",
   "web"
 );
+const RESERVED_SESSION_ROUTE_SEGMENTS = new Set(["batch", "export"]);
+
+function normalizeApiPathname(pathname) {
+  return pathname.length > 1 && pathname.endsWith("/") ? pathname.replace(/\/+$/g, "") : pathname;
+}
+
+function isReservedSessionRouteSegment(value) {
+  return RESERVED_SESSION_ROUTE_SEGMENTS.has(String(value ?? "").toLowerCase());
+}
 
 function isInsideDir(baseDir, targetPath) {
   const relative = path.relative(baseDir, targetPath);
@@ -122,19 +131,20 @@ export async function startDashboardServer(options = {}) {
   const server = http.createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      const pathname = normalizeApiPathname(url.pathname);
 
-      if (request.method === "GET" && url.pathname === "/api/health") {
+      if (request.method === "GET" && pathname === "/api/health") {
         json(response, 200, { ok: true, apiOnly });
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/api/config") {
+      if (request.method === "GET" && pathname === "/api/config") {
         const config = await store.inspectCodexHome();
         json(response, 200, { config });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/config") {
+      if (request.method === "POST" && pathname === "/api/config") {
         const body = await readJsonBody(request);
         const nextStore = new CodexSessionStore({
           ...storeOptions,
@@ -147,19 +157,19 @@ export async function startDashboardServer(options = {}) {
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/api/providers") {
+      if (request.method === "GET" && pathname === "/api/providers") {
         const providers = await store.getProviders();
         json(response, 200, { providers });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/prepare-backup") {
+      if (request.method === "POST" && pathname === "/api/prepare-backup") {
         const preparation = await store.prepareBackup();
         json(response, 200, preparation);
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/api/sessions") {
+      if (request.method === "GET" && pathname === "/api/sessions") {
         const sessions = await store.listSessions({
           provider: url.searchParams.get("provider") ?? "",
           search: url.searchParams.get("search") ?? "",
@@ -169,14 +179,21 @@ export async function startDashboardServer(options = {}) {
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/sessions/batch/retarget") {
+      if (request.method === "POST" && pathname === "/api/sessions/batch/retarget") {
         const body = await readJsonBody(request);
         const result = await store.batchRetargetSessions(body.threadIds, body.modelProvider);
         json(response, 200, { result });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/sessions/export/archive") {
+      if (request.method === "POST" && pathname === "/api/sessions/batch/clone") {
+        const body = await readJsonBody(request);
+        const result = await store.batchCloneSessions(body.threadIds, body.modelProvider);
+        json(response, 200, { result });
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/sessions/export/archive") {
         const body = await readJsonBody(request);
         const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-sessions-export-download-"));
         const archivePath = path.join(tempDir, "sessions-export.tgz");
@@ -197,31 +214,31 @@ export async function startDashboardServer(options = {}) {
         return;
       }
 
-      const detailMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
-      if (request.method === "GET" && detailMatch) {
+      const detailMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
+      if (request.method === "GET" && detailMatch && !isReservedSessionRouteSegment(detailMatch[1])) {
         const session = await store.getSession(detailMatch[1]);
         json(response, 200, { session });
         return;
       }
 
-      const cloneMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/clone$/);
-      if (request.method === "POST" && cloneMatch) {
+      const cloneMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/clone$/);
+      if (request.method === "POST" && cloneMatch && !isReservedSessionRouteSegment(cloneMatch[1])) {
         const body = await readJsonBody(request);
         const result = await store.cloneSession(cloneMatch[1], body.modelProvider);
         json(response, 200, { result });
         return;
       }
 
-      const exportMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/export$/);
-      if (request.method === "POST" && exportMatch) {
+      const exportMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/export$/);
+      if (request.method === "POST" && exportMatch && !isReservedSessionRouteSegment(exportMatch[1])) {
         const body = await readJsonBody(request);
         const result = await store.exportSession(exportMatch[1], body.outputPath);
         json(response, 200, { result });
         return;
       }
 
-      const exportDownloadMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/export\/download$/);
-      if (request.method === "POST" && exportDownloadMatch) {
+      const exportDownloadMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/export\/download$/);
+      if (request.method === "POST" && exportDownloadMatch && !isReservedSessionRouteSegment(exportDownloadMatch[1])) {
         const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-sessions-export-download-"));
         const safeThreadId = exportDownloadMatch[1].replace(/[^a-zA-Z0-9._-]/g, "_");
         const archivePath = path.join(tempDir, `session-${safeThreadId}.tgz`);
@@ -242,28 +259,28 @@ export async function startDashboardServer(options = {}) {
         return;
       }
 
-      const retargetMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/retarget$/);
-      if (request.method === "POST" && retargetMatch) {
+      const retargetMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/retarget$/);
+      if (request.method === "POST" && retargetMatch && !isReservedSessionRouteSegment(retargetMatch[1])) {
         const body = await readJsonBody(request);
         const result = await store.retargetSession(retargetMatch[1], body.modelProvider);
         json(response, 200, { result });
         return;
       }
 
-      const deleteMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
-      if (request.method === "DELETE" && deleteMatch) {
+      const deleteMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
+      if (request.method === "DELETE" && deleteMatch && !isReservedSessionRouteSegment(deleteMatch[1])) {
         const result = await store.deleteSession(deleteMatch[1]);
         json(response, 200, { result });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/backup") {
+      if (request.method === "POST" && pathname === "/api/backup") {
         const backup = await store.backupSnapshot();
         json(response, 200, { backupPath: backup.snapshotDir, backup });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/import") {
+      if (request.method === "POST" && pathname === "/api/import") {
         const body = await readJsonBody(request);
         const result = await store.importSession(body.inputPath, {
           force: body.force === true
@@ -272,7 +289,7 @@ export async function startDashboardServer(options = {}) {
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/import/archive") {
+      if (request.method === "POST" && pathname === "/api/import/archive") {
         const archiveBuffer = await readRequestBodyBuffer(request);
         if (archiveBuffer.length === 0) {
           throw new Error("Import archive payload is empty.");
@@ -301,7 +318,7 @@ export async function startDashboardServer(options = {}) {
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/api/import/archive/batch") {
+      if (request.method === "POST" && pathname === "/api/import/archive/batch") {
         const archiveBuffer = await readRequestBodyBuffer(request);
         if (archiveBuffer.length === 0) {
           throw new Error("Import archive payload is empty.");
@@ -347,7 +364,9 @@ export async function startDashboardServer(options = {}) {
     server.listen(port, "127.0.0.1", resolve);
   });
 
-  const url = `http://127.0.0.1:${port}`;
+  const address = server.address();
+  const boundPort = typeof address === "object" && address ? address.port : port;
+  const url = `http://127.0.0.1:${boundPort}`;
   if (!apiOnly && options.open !== false) {
     openUrl(url);
   }

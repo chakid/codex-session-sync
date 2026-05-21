@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import * as tar from "tar";
+import { startDashboardServer } from "../backend/server.js";
 import { getSqlJs } from "../backend/sqlite.js";
 import { CodexSessionStore } from "../backend/store.js";
 
@@ -127,6 +128,13 @@ async function createFixture(options = {}) {
     `);
   }
 
+  db.run(`
+    CREATE TABLE stage1_outputs (
+      thread_id TEXT PRIMARY KEY,
+      content TEXT NOT NULL
+    );
+  `);
+
   if (options.seedThread !== false) {
     db.run(
       `
@@ -185,6 +193,13 @@ async function createFixture(options = {}) {
         `
       );
     }
+
+    db.run(
+      `
+        INSERT INTO stage1_outputs (thread_id, content)
+        VALUES ('source-thread', 'stage output')
+      `
+    );
   }
 
   const dbPath = path.join(codexHome, "state_5.sqlite");
@@ -866,7 +881,7 @@ test("getSession prefers event message timestamps over replayed response items",
   );
 });
 
-test("cloneSession duplicates thread row and rollout jsonl without copying dynamic tools", async () => {
+test("cloneSession duplicates thread row, rollout jsonl, and thread-scoped records", async () => {
   const fixture = await createFixture();
   const store = new CodexSessionStore({
     codexHome: fixture.codexHome,
@@ -885,8 +900,37 @@ test("cloneSession duplicates thread row and rollout jsonl without copying dynam
   assert.notEqual(cloned.rollout_path, fixture.rolloutPath);
   assert.equal(original.rollout_path, fixture.rolloutPath);
   assert.equal(original.model_provider, "openai");
-  assert.equal(cloned.dynamic_tools.length, 0);
+  assert.deepEqual(
+    cloned.dynamic_tools.map((tool) => ({
+      position: tool.position,
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.input_schema,
+      defer_loading: tool.defer_loading
+    })),
+    [
+      {
+        position: 0,
+        name: "tool-a",
+        description: "desc",
+        input_schema: "{}",
+        defer_loading: false
+      }
+    ]
+  );
   assert.equal(sessions.length, 2);
+
+  const SQL = await getSqlJs();
+  const db = new SQL.Database(await fs.readFile(fixture.dbPath));
+  const stageRows = db.exec("SELECT thread_id, content FROM stage1_outputs")[0].values;
+  db.close();
+  assert.deepEqual(
+    stageRows.sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+    [
+      [result.clonedId, "stage output"],
+      ["source-thread", "stage output"]
+    ].sort((left, right) => String(left[0]).localeCompare(String(right[0])))
+  );
 
   const sessionIndex = await readSessionIndexEntries(fixture.sessionIndexPath);
   assert.equal(sessionIndex.length, 2);
@@ -961,6 +1005,75 @@ test("cloneSession rejects the current provider", async () => {
     () => store.cloneSession("source-thread", "openai"),
     /Target provider must differ from the current session model_provider for cloning/
   );
+});
+
+test("batchCloneSessions clones eligible sessions and skips sessions already on the target provider", async () => {
+  const fixture = await createFixture();
+  await addThreadToFixture(fixture, {
+    threadId: "second-thread",
+    modelProvider: "anthropic",
+    updatedAt: 4,
+    title: "Second thread",
+    rolloutContent: `${JSON.stringify({
+      type: "session_meta",
+      payload: { id: "second-thread", model_provider: "anthropic" }
+    })}\n`
+  });
+
+  const store = new CodexSessionStore({
+    codexHome: fixture.codexHome,
+    dbPath: fixture.dbPath,
+    skipSqlitePrepare: true
+  });
+
+  const result = await store.batchCloneSessions(["source-thread", "second-thread"], "anthropic");
+  const sessions = await store.listSessions({ limit: 10 });
+  const cloned = await store.getSession(result.clonedIds[0]);
+
+  assert.equal(result.modelProvider, "anthropic");
+  assert.equal(result.clonedIds.length, 1);
+  assert.deepEqual(result.skippedIds, ["second-thread"]);
+  assert.equal(cloned.model_provider, "anthropic");
+  assert.equal(cloned.title, "Fixture thread");
+  assert.equal(sessions.length, 3);
+});
+
+test("dashboard batch clone route is handled before reserved session detail ids", async () => {
+  const fixture = await createFixture();
+  const { server, url } = await startDashboardServer({
+    apiOnly: true,
+    open: false,
+    port: 0,
+    codexHome: fixture.codexHome,
+    dbPath: fixture.dbPath,
+    skipSqlitePrepare: true
+  });
+
+  try {
+    const response = await fetch(`${url}/api/sessions/batch/clone/`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        threadIds: ["source-thread"],
+        modelProvider: "anthropic"
+      })
+    });
+    const payload = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.result.modelProvider, "anthropic");
+    assert.equal(payload.result.clonedIds.length, 1);
+
+    const reservedResponse = await fetch(`${url}/api/sessions/batch`);
+    const reservedPayload = await reservedResponse.json();
+
+    assert.equal(reservedResponse.status, 404);
+    assert.equal(reservedPayload.error, "Static dashboard is disabled in API-only mode.");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("retargetSession rewrites rollout provider and updates the thread provider without changing updated_at", async () => {

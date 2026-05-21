@@ -471,6 +471,10 @@ function buildInsertSql(tableName, columns, row) {
   return `INSERT INTO ${tableName} (${columns.join(", ")}) VALUES (${encodedValues.join(", ")});`;
 }
 
+function quoteSqlIdentifier(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
+
 function parseInsertSqlValues(sql) {
   const match = sql.match(
     /^\s*INSERT\s+INTO\s+\w+\s*\(([\s\S]+?)\)\s*VALUES\s*\(([\s\S]+?)\)\s*;?\s*$/i
@@ -1144,8 +1148,84 @@ export class CodexSessionStore {
       return new Set();
     }
 
-    const rows = selectAll(db, `PRAGMA table_info(${tableName})`);
+    const rows = selectAll(db, `PRAGMA table_info(${quoteSqlIdentifier(tableName)})`);
     return new Set(rows.map((row) => String(row.name)));
+  }
+
+  async getTableColumnInfo(db, tableName) {
+    if (!(await this.tableExists(db, tableName))) {
+      return [];
+    }
+
+    return selectAll(db, `PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).map((row) => ({
+      ...row,
+      name: String(row.name)
+    }));
+  }
+
+  async cloneThreadScopedRows(db, tableName, sourceThreadId, clonedThreadId) {
+    const columns = await this.getTableColumnInfo(db, tableName);
+    if (!columns.some((column) => column.name === "thread_id")) {
+      return 0;
+    }
+
+    const tableIdentifier = quoteSqlIdentifier(tableName);
+    const rows = selectAll(
+      db,
+      `SELECT * FROM ${tableIdentifier} WHERE ${quoteSqlIdentifier("thread_id")} = :sourceThreadId`,
+      { ":sourceThreadId": sourceThreadId }
+    );
+    if (rows.length === 0) {
+      return 0;
+    }
+
+    const insertColumns = columns.map((column) => column.name);
+    const columnList = insertColumns.map((column) => quoteSqlIdentifier(column)).join(", ");
+    const placeholders = insertColumns.map((column) => `:${column}`).join(", ");
+
+    for (const row of rows) {
+      const clonedRow = {
+        ...row,
+        thread_id: clonedThreadId
+      };
+      const params = Object.fromEntries(insertColumns.map((column) => [`:${column}`, clonedRow[column] ?? null]));
+      db.run(`INSERT INTO ${tableIdentifier} (${columnList}) VALUES (${placeholders})`, params);
+    }
+
+    return rows.length;
+  }
+
+  async buildCloneThreadScopedSql(db, tableName, sourceThreadId, clonedThreadId) {
+    const columns = await this.getTableColumnInfo(db, tableName);
+    if (!columns.some((column) => column.name === "thread_id")) {
+      return { sql: "", count: 0 };
+    }
+
+    const tableIdentifier = quoteSqlIdentifier(tableName);
+    const rows = selectAll(
+      db,
+      `SELECT ${quoteSqlIdentifier("thread_id")} FROM ${tableIdentifier} WHERE ${quoteSqlIdentifier("thread_id")} = :sourceThreadId`,
+      { ":sourceThreadId": sourceThreadId }
+    );
+    if (rows.length === 0) {
+      return { sql: "", count: 0 };
+    }
+
+    const insertColumns = columns.map((column) => column.name);
+    const columnList = insertColumns.map((column) => quoteSqlIdentifier(column)).join(", ");
+    const selectList = insertColumns
+      .map((column) => (column === "thread_id" ? encodeSqlLiteral(clonedThreadId) : quoteSqlIdentifier(column)))
+      .join(", ");
+
+    return {
+      sql: `
+        INSERT INTO ${tableIdentifier} (${columnList})
+        SELECT ${selectList}
+        FROM ${tableIdentifier}
+        WHERE ${quoteSqlIdentifier("thread_id")} = ${encodeSqlLiteral(sourceThreadId)};
+      `,
+      count: rows.length
+    };
   }
 
   async openReadDatabase(requiredTables = ["threads"]) {
@@ -2018,6 +2098,67 @@ try {
       }));
   }
 
+  async runSqliteScript(sql) {
+    try {
+      const { stdout } = await execFileAsync(this.sqlite3Bin, [this.dbPath, sql], {
+        maxBuffer: 1024 * 1024
+      });
+      return stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        throw new Error(
+          "`sqlite3` command not found. Live database writes require a local sqlite3 CLI."
+        );
+      }
+
+      const stderr =
+        error && typeof error === "object" && "stderr" in error ? String(error.stderr).trim() : "";
+      throw new Error(stderr || "Failed to execute sqlite3 script.");
+    }
+  }
+
+  async prepareDatabaseWrite() {
+    await ensureFile(this.dbPath);
+
+    if (!(await this.hasSqliteCli())) {
+      return this.prepareBackup();
+    }
+
+    const integrityMessages = await this.runSqlitePragma("PRAGMA integrity_check;");
+    const integrityOk = integrityMessages.length === 1 && integrityMessages[0] === "ok";
+    if (!integrityOk) {
+      throw new Error(`SQLite integrity_check failed: ${integrityMessages.join("; ")}`);
+    }
+
+    const walPath = `${this.dbPath}-wal`;
+    const shmPath = `${this.dbPath}-shm`;
+    const before = {
+      database: await this.getSidecarState(this.dbPath),
+      wal: await this.getSidecarState(walPath),
+      shm: await this.getSidecarState(shmPath)
+    };
+
+    return {
+      ok: true,
+      skipped: false,
+      sqlite3Available: true,
+      mode: "sqlite3-live-write",
+      checkpoint: [],
+      integrity: {
+        ok: integrityOk,
+        messages: integrityMessages
+      },
+      before,
+      after: before,
+      filesCleared: !before.wal.exists && !before.shm.exists,
+      occupied: null,
+      openHandles: []
+    };
+  }
+
   async getProviders() {
     const sessions = await this.loadMergedSessionSummaries();
     const counts = new Map();
@@ -2309,7 +2450,7 @@ try {
     }
 
     await ensureFile(source.rollout_path);
-    const preparation = await this.prepareBackup();
+    const preparation = await this.prepareDatabaseWrite();
 
     const now = new Date();
     const nowTs = currentUnixTime();
@@ -2325,38 +2466,77 @@ try {
       targetProvider: String(targetProvider).trim()
     });
 
+    const clonedThread = {
+      ...source,
+      id: clonedId,
+      rollout_path: clonedRolloutPath,
+      created_at: nowTs,
+      updated_at: nowTs,
+      created_at_ms: nowTs * 1000,
+      updated_at_ms: nowTs * 1000,
+      model_provider: String(targetProvider).trim(),
+      archived: 0,
+      archived_at: null
+    };
+
     try {
       const db = await loadDatabase(this.dbPath);
       const threadColumns = await this.getTableColumns(db, "threads");
-      db.run("BEGIN");
-
-      const clonedThread = {
-        ...source,
-        id: clonedId,
-        rollout_path: clonedRolloutPath,
-        created_at: nowTs,
-        updated_at: nowTs,
-        created_at_ms: nowTs * 1000,
-        updated_at_ms: nowTs * 1000,
-        model_provider: String(targetProvider).trim(),
-        archived: 0,
-        archived_at: null
+      const availableThreadColumns = THREAD_COLUMNS.filter((column) => threadColumns.has(column));
+      const clonedRelatedRows = {
+        dynamicTools: 0,
+        stage1Outputs: 0
       };
 
-      const availableThreadColumns = THREAD_COLUMNS.filter((column) => threadColumns.has(column));
-      const placeholders = availableThreadColumns.map((column) => `:${column}`).join(", ");
-      const boundThread = Object.fromEntries(
-        availableThreadColumns.map((column) => [`:${column}`, clonedThread[column] ?? null])
-      );
-      db.run(
-        `INSERT INTO threads (${availableThreadColumns.join(", ")}) VALUES (${placeholders})`,
-        boundThread
-      );
+      if (preparation.mode === "sqlite3-live-write") {
+        const liveCloneDynamicTools = await this.buildCloneThreadScopedSql(
+          db,
+          "thread_dynamic_tools",
+          String(source.id),
+          clonedId
+        );
+        const liveCloneStage1Outputs = await this.buildCloneThreadScopedSql(
+          db,
+          "stage1_outputs",
+          String(source.id),
+          clonedId
+        );
+        db.close();
 
-      db.run("COMMIT");
-      const updatedBytes = db.export();
-      db.close();
-      await fs.writeFile(this.dbPath, Buffer.from(updatedBytes));
+        const insertColumns = availableThreadColumns.map((column) => quoteSqlIdentifier(column)).join(", ");
+        const insertValues = availableThreadColumns.map((column) => encodeSqlLiteral(clonedThread[column] ?? null)).join(", ");
+
+        await this.runSqliteScript(`
+          PRAGMA busy_timeout = 10000;
+          BEGIN IMMEDIATE;
+          INSERT INTO ${quoteSqlIdentifier("threads")} (${insertColumns}) VALUES (${insertValues});
+          ${liveCloneDynamicTools.sql}
+          ${liveCloneStage1Outputs.sql}
+          COMMIT;
+        `);
+
+        clonedRelatedRows.dynamicTools = liveCloneDynamicTools.count;
+        clonedRelatedRows.stage1Outputs = liveCloneStage1Outputs.count;
+      } else {
+        db.run("BEGIN");
+
+        const placeholders = availableThreadColumns.map((column) => `:${column}`).join(", ");
+        const boundThread = Object.fromEntries(
+          availableThreadColumns.map((column) => [`:${column}`, clonedThread[column] ?? null])
+        );
+        db.run(
+          `INSERT INTO threads (${availableThreadColumns.join(", ")}) VALUES (${placeholders})`,
+          boundThread
+        );
+
+        clonedRelatedRows.dynamicTools = await this.cloneThreadScopedRows(db, "thread_dynamic_tools", String(source.id), clonedId);
+        clonedRelatedRows.stage1Outputs = await this.cloneThreadScopedRows(db, "stage1_outputs", String(source.id), clonedId);
+
+        db.run("COMMIT");
+        const updatedBytes = db.export();
+        db.close();
+        await fs.writeFile(this.dbPath, Buffer.from(updatedBytes));
+      }
       await this.upsertSessionIndexEntry(clonedThread);
 
       return {
@@ -2364,12 +2544,57 @@ try {
         sourceId: threadId,
         clonedId,
         modelProvider: String(targetProvider).trim(),
-        rolloutPath: clonedRolloutPath
+        rolloutPath: clonedRolloutPath,
+        clonedRelatedRows
       };
     } catch (error) {
       await fs.rm(clonedRolloutPath, { force: true });
       throw error;
     }
+  }
+
+  async batchCloneSessions(threadIds, targetProvider) {
+    if (!Array.isArray(threadIds) || threadIds.length === 0) {
+      throw new Error("At least one session is required for batch cloning.");
+    }
+    if (!targetProvider || !String(targetProvider).trim()) {
+      throw new Error("Target provider is required for batch cloning.");
+    }
+
+    const normalizedTargetProvider = String(targetProvider).trim();
+    const sessions = [];
+    for (const threadId of threadIds) {
+      const session = await this.getSession(threadId);
+      sessions.push(session);
+    }
+
+    const skippedIds = sessions
+      .filter((session) => String(session.model_provider).trim() === normalizedTargetProvider)
+      .map((session) => String(session.id));
+    const candidates = sessions.filter(
+      (session) => String(session.model_provider).trim() !== normalizedTargetProvider
+    );
+
+    if (candidates.length === 0) {
+      return {
+        preparation: null,
+        modelProvider: normalizedTargetProvider,
+        clonedIds: [],
+        skippedIds
+      };
+    }
+
+    const results = [];
+    for (const session of candidates) {
+      results.push(await this.cloneSession(String(session.id), normalizedTargetProvider));
+    }
+
+    return {
+      preparation: results[0]?.preparation ?? null,
+      modelProvider: normalizedTargetProvider,
+      clonedIds: results.map((result) => result.clonedId),
+      skippedIds
+    };
   }
 
   async retargetSession(threadId, targetProvider) {
@@ -2382,42 +2607,60 @@ try {
       throw new Error("Target provider must differ from the current session model_provider for retargeting.");
     }
     await ensureFile(source.rollout_path);
-    const preparation = await this.prepareBackup();
+    const preparation = await this.prepareDatabaseWrite();
     const normalizedTargetProvider = String(targetProvider).trim();
     await rewriteRetargetedRolloutJsonl(source.rollout_path, {
       sourceProvider: String(source.model_provider ?? ""),
       targetProvider: normalizedTargetProvider
     });
 
-    const db = await loadDatabase(this.dbPath);
-    const threadColumns = await this.getTableColumns(db, "threads");
-    const updates = [];
-    const params = {
-      ":threadId": threadId
-    };
-
-    if (threadColumns.has("model_provider")) {
-      updates.push("model_provider = :targetProvider");
-      params[":targetProvider"] = normalizedTargetProvider;
-    }
-
-    if (updates.length === 0) {
+    if (preparation.mode === "sqlite3-live-write") {
+      const db = await loadDatabase(this.dbPath);
+      const threadColumns = await this.getTableColumns(db, "threads");
       db.close();
-      throw new Error("Cannot retarget this database because required thread columns are missing.");
+      if (!threadColumns.has("model_provider")) {
+        throw new Error("Cannot retarget this database because required thread columns are missing.");
+      }
+
+      await this.runSqliteScript(`
+        PRAGMA busy_timeout = 10000;
+        BEGIN IMMEDIATE;
+        UPDATE ${quoteSqlIdentifier("threads")}
+        SET ${quoteSqlIdentifier("model_provider")} = ${encodeSqlLiteral(normalizedTargetProvider)}
+        WHERE ${quoteSqlIdentifier("id")} = ${encodeSqlLiteral(threadId)};
+        COMMIT;
+      `);
+    } else {
+      const db = await loadDatabase(this.dbPath);
+      const threadColumns = await this.getTableColumns(db, "threads");
+      const updates = [];
+      const params = {
+        ":threadId": threadId
+      };
+
+      if (threadColumns.has("model_provider")) {
+        updates.push("model_provider = :targetProvider");
+        params[":targetProvider"] = normalizedTargetProvider;
+      }
+
+      if (updates.length === 0) {
+        db.close();
+        throw new Error("Cannot retarget this database because required thread columns are missing.");
+      }
+
+      db.run(
+        `
+          UPDATE threads
+          SET ${updates.join(",\n            ")}
+          WHERE id = :threadId
+        `,
+        params
+      );
+
+      const updatedBytes = db.export();
+      db.close();
+      await fs.writeFile(this.dbPath, Buffer.from(updatedBytes));
     }
-
-    db.run(
-      `
-        UPDATE threads
-        SET ${updates.join(",\n            ")}
-        WHERE id = :threadId
-      `,
-      params
-    );
-
-    const updatedBytes = db.export();
-    db.close();
-    await fs.writeFile(this.dbPath, Buffer.from(updatedBytes));
 
     return {
       preparation,
@@ -2464,7 +2707,7 @@ try {
       await ensureFile(session.rollout_path);
     }
 
-    const preparation = await this.prepareBackup();
+    const preparation = await this.prepareDatabaseWrite();
     const rolloutBackups = new Map();
 
     try {
@@ -2479,38 +2722,64 @@ try {
         });
       }
 
-      const db = await loadDatabase(this.dbPath);
-      try {
+      if (preparation.mode === "sqlite3-live-write") {
+        const db = await loadDatabase(this.dbPath);
         const threadColumns = await this.getTableColumns(db, "threads");
+        db.close();
         if (!threadColumns.has("model_provider")) {
           throw new Error("Cannot retarget this database because required thread columns are missing.");
         }
 
-        db.run("BEGIN");
-        for (const session of candidates) {
-          db.run(
+        const updates = candidates
+          .map(
+            (session) => `
+              UPDATE ${quoteSqlIdentifier("threads")}
+              SET ${quoteSqlIdentifier("model_provider")} = ${encodeSqlLiteral(normalizedTargetProvider)}
+              WHERE ${quoteSqlIdentifier("id")} = ${encodeSqlLiteral(String(session.id))};
             `
-              UPDATE threads
-              SET model_provider = :targetProvider
-              WHERE id = :threadId
-            `,
-            {
-              ":targetProvider": normalizedTargetProvider,
-              ":threadId": String(session.id)
-            }
-          );
-        }
-        db.run("COMMIT");
+          )
+          .join("\n");
 
-        const updatedBytes = db.export();
-        await fs.writeFile(this.dbPath, Buffer.from(updatedBytes));
-      } catch (error) {
+        await this.runSqliteScript(`
+          PRAGMA busy_timeout = 10000;
+          BEGIN IMMEDIATE;
+          ${updates}
+          COMMIT;
+        `);
+      } else {
+        const db = await loadDatabase(this.dbPath);
         try {
-          db.run("ROLLBACK");
-        } catch {}
-        throw error;
-      } finally {
-        db.close();
+          const threadColumns = await this.getTableColumns(db, "threads");
+          if (!threadColumns.has("model_provider")) {
+            throw new Error("Cannot retarget this database because required thread columns are missing.");
+          }
+
+          db.run("BEGIN");
+          for (const session of candidates) {
+            db.run(
+              `
+                UPDATE threads
+                SET model_provider = :targetProvider
+                WHERE id = :threadId
+              `,
+              {
+                ":targetProvider": normalizedTargetProvider,
+                ":threadId": String(session.id)
+              }
+            );
+          }
+          db.run("COMMIT");
+
+          const updatedBytes = db.export();
+          await fs.writeFile(this.dbPath, Buffer.from(updatedBytes));
+        } catch (error) {
+          try {
+            db.run("ROLLBACK");
+          } catch {}
+          throw error;
+        } finally {
+          db.close();
+        }
       }
 
       return {
